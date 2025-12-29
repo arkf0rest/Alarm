@@ -33,8 +33,8 @@ To install it, you must load it manually using Chrome's Developer Mode.
 - Installing the `.crx` file directly is **not supported** on most systems and may fail silently.
 - Always use **"Load unpacked"** for local installation.
 - If you update the extension:
-- Replace the files in the folder
-- Click **Reload** on the extension card in `chrome://extensions`
+  - Replace the files in the folder
+  - Click **Reload** on the extension card in `chrome://extensions`
 
 ---
 
