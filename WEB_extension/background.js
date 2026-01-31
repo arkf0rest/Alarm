@@ -1,0 +1,321 @@
+let isReadyAttack = true;
+let isReadyExpe = false;
+let offscreenReady = false;
+let lastSoundTime = 0;
+const SOUND_COOLDOWN = 10_000; // 10 secondes
+const CHECK_INTERVAL = 3000; // 3 secondes
+let CSRF_TOKEN = null;
+
+// Vérifier le pseudo du joueur connecté
+// Au démarrage
+fetchCurrentPseudo();
+
+// Refresh toutes les 10 minutes
+setInterval(fetchCurrentPseudo, 10 * 60 * 1000);
+
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.action === "csrfToken") {
+    CSRF_TOKEN = msg.token;
+    console.log("✅ CSRF reçu :", CSRF_TOKEN);
+  }
+});
+
+
+// --- Récupération de l'URL du serveur ---
+fetch("https://raw.githubusercontent.com/arkf0rest/E-univers_alarm/main/server.json")
+  .then(res => res.json())
+  .then(data => {
+    chrome.storage.local.set({ server_url: data.url });
+    console.log("URL du serveur mise à jour :", data.url);
+  })
+  .catch(err => console.error("Impossible de récupérer server.json", err));
+
+// --- Décodage JWT ---
+function decodeJWT(token) {
+  try {
+    const payload = token.split('.')[1];
+    return JSON.parse(atob(payload));
+  } catch (e) {
+    return null;
+  }
+}
+
+// --- Récupération d'un token valide ---
+async function getToken() {
+  const storage = await chrome.storage.local.get(["token", "expiry"]);
+  let { token, expiry } = storage;
+
+  if (!token || !expiry || Date.now() >= expiry) {
+    const { server_url } = await chrome.storage.local.get(["server_url"]);
+    if (!server_url) throw new Error("server_url manquant");
+
+    const res = await fetch(`${server_url}/get_token`, {
+      headers: { "X-EXTENSION-SECRET": "aKF7UiBihUenjFgme_5LgHcxHiirH4pX3KmbyebU5scoCjwsdpnx0NdQyFyb0v9XnHA",
+                  "ngrok-skip-browser-warning": "true"
+       }
+    });
+
+    const data = await res.json();
+    token = data.token;
+    const decoded = decodeJWT(token);
+    expiry = decoded?.exp ? decoded.exp * 1000 : Date.now() + 3600000;
+    await chrome.storage.local.set({ token, expiry });
+
+    console.log("✅ Nouveau token récupéré, expire à", new Date(expiry).toLocaleTimeString());
+  }
+
+  return token;
+}
+
+// --- Récupération des flottes ---
+async function getFleets() {
+  try {
+    const storage = await chrome.storage.local.get("CURRENT_USER_PSEUDO");
+    const CURRENT_USER_PSEUDO = storage.CURRENT_USER_PSEUDO?.trim().toLowerCase();
+
+    if (!CSRF_TOKEN) {
+      console.warn("❌ CSRF manquant, impossible de fetch les flottes");
+      return null;
+    }
+    
+    const res = await fetch(
+      "https://e-univers.fr/FONCTIONS/FLOTTES/get_fleets.php",
+      {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-CSRF-Token": CSRF_TOKEN
+        },
+        body: "serveur_id=3"
+      }
+    );
+
+
+    console.log("➡️ Status HTTP:", res.status);
+    console.log("➡️ Headers:", [...res.headers.entries()]);
+
+    if (!res.ok) return null;
+
+    const text = await res.text();
+    const jsonStart = text.indexOf('{');
+    const jsonData = JSON.parse(text.slice(jsonStart));
+
+    // 🔥 LOG DU JSON PARSÉ
+    console.log("✅ JSON PARSÉ:", jsonData);
+
+    const missions = jsonData.missions ?? [];
+    const attackFleet = [];
+    const attaquants = new Set();
+    const arrivalTime = new Set();
+    const targetCoords = new Set();
+
+    for (const mission of missions) {
+      const missionPseudo = mission.owner_pseudo?.trim().toLowerCase();
+       if (CURRENT_USER_PSEUDO && missionPseudo === CURRENT_USER_PSEUDO) continue;
+
+      if (mission.mission_type === "attaquer") {
+        attaquants.add(mission.owner_pseudo);
+        const date = new Date(mission.arrival_time * 1000);
+        arrivalTime.add(date.toLocaleTimeString('fr-FR'));
+
+        const targetCoords_str = [
+          mission.galaxy_target,
+          mission.system_target,
+          mission.planet_target
+        ].join('-');
+        
+        targetCoords.add(targetCoords_str);
+
+        const fleet = JSON.parse(mission.fleet);
+
+        for (const vaisseau of fleet) {
+          const existing = attackFleet.find(v => v.id === vaisseau.id);
+          if (existing) existing.nombre += vaisseau.nombre;
+          else attackFleet.push({ id: vaisseau.id, nombre: vaisseau.nombre });
+        }
+      }
+    }
+
+    return {
+      attack: attackFleet.length > 0,
+      attackFleet,
+      attaquants: [...attaquants],
+      arrivalTime: [...arrivalTime],
+      targetCoords: [...targetCoords],
+      expe: jsonData.Expe
+    };
+
+
+  } catch (err) {
+    console.error("Erreur getFleets", err);
+    return null;
+  }
+}
+
+// --- Check régulier avec setInterval ---
+setInterval(async () => {
+  console.log("Get fleet");
+  const fleets = await getFleets();
+  if (!fleets) return;
+
+  // Récupération des paramètres stockés
+  const { discord_id, server_url, audioEnable, exploreEnable, attackEnable } =
+    await chrome.storage.local.get([
+      "discord_id",
+      "server_url",
+      "audioEnable",
+      "exploreEnable",
+      "attackEnable"
+    ]);
+
+  if (!discord_id || !server_url) return;
+
+  const token = await getToken();
+
+  // --- Check attaques ---
+  if (fleets.attack && isReadyAttack) {
+    isReadyAttack = false;
+
+    // Construction du message
+    const msg = {
+      message: "⚠️ Une attaque est en cours.",
+      fleet: fleets.attackFleet, 
+      attaquants: fleets.attaquants, 
+      arrivalTime: fleets.arrivalTime, 
+      targetCoords: fleets.targetCoords 
+    }
+    // Sauvegarde local
+    saveMessage(msg)
+
+    if (attackEnable) {
+
+      fetch(`${server_url}/notify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+        body: JSON.stringify({
+          ...msg,
+          discord_id
+        })
+      }).catch(console.error);
+    }
+
+    if (audioEnable) playOffscreenSound();
+  }
+
+  // --- Check expé ---
+  if (exploreEnable && fleets.expe === 0 && isReadyExpe) {
+    isReadyExpe = false;
+
+    fetch(`${server_url}/notify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+      body: JSON.stringify({ 
+        message: "Toutes les expéditions sont rentrées.",
+        discord_id
+      })
+    }).catch(console.error);
+  }
+
+  // --- Réarmement ---
+  if (!fleets.attack) isReadyAttack = true;
+  if (fleets.expe > 0) isReadyExpe = true;
+
+}, CHECK_INTERVAL);
+
+
+// --- OFFSCREEN AUDIO ---
+async function ensureOffscreen() {
+  if (!(await chrome.offscreen.hasDocument())) {
+    await chrome.offscreen.createDocument({ url: "offscreen.html", reasons: ["AUDIO_PLAYBACK"], justification: "Play alert sound" });
+  }
+  offscreenReady = true;
+}
+
+async function playOffscreenSound() {
+  const now = Date.now();
+  if (now - lastSoundTime < SOUND_COOLDOWN) return;
+  lastSoundTime = now;
+
+  await ensureOffscreen();
+  chrome.runtime.sendMessage({ action: "offscreen-play-sound" });
+}
+
+chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
+  if (msg.action === "sendToServer") {
+    const { data } = msg;
+    try {
+      const { server_url } = await chrome.storage.local.get("server_url");
+      const token = await getToken(); // déjà présent dans ton background
+
+      await fetch(`${server_url}/update_galaxy`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ players: data })
+      });
+
+      console.log("✅ Données galaxie envoyées au serveur");
+    } catch (e) {
+      console.error("❌ Erreur envoi galaxie au serveur", e);
+    }
+  }
+});
+
+// --- 1️⃣ Récupérer le HTML de la page générale ---
+async function fetchHTML(url) {
+  try {
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error("Erreur HTTP " + res.status);
+    const html = await res.text();
+    return html;
+  } catch (err) {
+    console.error("Erreur fetchHTML", err);
+    return null;
+  }
+}
+
+// --- 2️⃣ Extraire le pseudo du joueur ---
+function parsePseudo(html) {
+  // Cherche la div classement-card
+  const divMatch = html.match(/<div class="classement-card"[^>]*>[\s\S]*?<\/h4>/);
+  if (!divMatch) return null;
+
+  // Cherche le pseudo entre "Classement - " et " -"
+  const pseudoMatch = divMatch[0].match(/Classement - (.+?) -/);
+  if (!pseudoMatch) return null;
+
+  return pseudoMatch[1];
+}
+
+// --- 3️⃣ Fonction principale pour récupérer le pseudo ---
+async function fetchCurrentPseudo() {
+  const html = await fetchHTML("https://e-univers.fr/RENDER/generale.php?serveur_id=3&planet_id=1");
+  if (!html) return null;
+
+  const pseudo = parsePseudo(html);
+  if (!pseudo) return null;
+
+  await chrome.storage.local.set({ CURRENT_USER_PSEUDO: pseudo });
+  console.log("✅ Pseudo récupéré :", pseudo);
+  return pseudo;
+}
+
+function saveMessage(message) {
+  chrome.storage.local.get({ messages: [] }, (data) => {
+    const messages = data.messages;
+    messages.push(message);
+
+    chrome.storage.local.set({ messages });
+  });
+}
+
+
+// --- Usage ---
+// Au démarrage
+fetchCurrentPseudo();
+// Toutes les 10 minutes
+setInterval(fetchCurrentPseudo, 10 * 60 * 1000);
