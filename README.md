@@ -60,7 +60,6 @@ It also includes a user-friendly popup interface with real-time progress updates
 | Option                    | Description                                                            |
 | ------------------------- | ---------------------------------------------------------------------- |
 | **Server URL**            | Fetched dynamically from `server.json` on GitHub.                      |
-| **JWT Token**             | Retrieved automatically for secure server communication.               |
 | **Notification Settings** | Configurable to enable/disable attack or expedition alerts.            |
 
 ---
